@@ -75,10 +75,15 @@
 
 - 有效时长 = min(教师申报时长, 该活动类型标准时长上限)；申报 120 分钟的体育课封顶 40，
   封顶动作在 `flags` 留痕；
-- 同一 (token, 场次) 的重复签到只计最早一次，重复事件保留并标 `duplicate_signin:*`，
-  **绝不增加人数或时长**；
-- 离线补签受理时限 48 小时（`OFFLINE_ACCEPT_HOURS`），超时仅留痕（`offline_late:*`）不计入，
-  防止事后集中补签把没上的课"签出来"；
+- 签到时间一律要求**带时区偏移的 ISO 8601**，解析后统一到 UTC 同一时间线再比较；
+  无时区、无法解析、接收早于发生的记录判无效并留痕
+  （`clock_anomaly:unparseable:*` / `clock_anomaly:received_before_occurred:*`），
+  跨时区交流周的记录绝不按截断后的本地钟面计算；
+- 同一 (token, 场次) 的多条候选**先各自判定有效，再按稳定规则选取**
+  （最早发生时刻，接收时刻/设备号兜底）；无效候选绝不因替换去重被带回样本，
+  重复事件保留并标 `duplicate_signin:*`，**绝不增加人数或时长**；
+- 离线补签受理时限 48 小时（`OFFLINE_ACCEPT_HOURS`，按 UTC 时间线计），
+  超时仅留痕（`offline_late:*`）不计入，防止事后集中补签把没上的课"签出来"；
 - 伤病适配按学生、按技能折减（`InjuryAdaptation.adjusted_minutes`，0 为见习），
   必须引用医嘱/申请依据，且只影响该生，不影响班级场次成立。
 
@@ -113,6 +118,11 @@
 补课安排（`makeup_schedule` 原场次→补课场次，完成后原场次回填为 completed 并记入 `made_up`）。
 未来周次不参与核对，避免把"还没上"误报为缺口。
 
+重放先把事件整理为以场次为键的索引再判定，**追加顺序变化不改变确认结果**；
+补传到达后可用 `reconfirm_occasion` 只重算对应场次（含补课挂接两端），
+其余场次沿用旧结论，输出与全量重放一致，家长视图与班级覆盖率随之同步看到
+修正后的有效时长。
+
 ## 6. "教会、勤练、常赛"覆盖规则（coverage.py）
 
 评价单位是**技能目标 × 班级**，不是学生体测分数。每个 `SkillGoal` 声明
@@ -136,7 +146,7 @@ teach/practice/match 计划周次；覆盖只统计**经三方确认且实际传
 | `exam_drill_pattern` / `free_play_pattern` | 连续 2 场只练考试项目 / 整节自由活动 |
 | `takeover_chain` | 连续 2 起临时占课 |
 | `venue_conflict` / `capacity_breach` | 实际场地冲突 / 实际人数超安全容量 |
-| `signin_anomaly` | 重复签到、超时补签集中出现 |
+| `signin_anomaly` | 重复签到、超时补签、时钟异常（无时区/无法解析/接收早于发生）集中出现 |
 
 异常班级由 `ReviewBoard` 开案进入"教研复核"状态。复核结论四选一：
 无异常（天气/调课有据，`cleared`）、确认缺口并安排补课（`makeup_ordered`）、
@@ -172,13 +182,13 @@ pe_domain/
   review.py     异常识别 + 复核台账（开案/补证/澄清/补课令）
   ledger.py     只追加账本 + 单班实况重放
   visibility.py 身份保管处 + 公众聚合 + 家长视图
-test_pe_domain.py  31 个领域规则测试
+test_pe_domain.py  43 个领域规则测试
 service_contract.py 3 个服务契约测试（原有健康检查）
 ```
 
 ```bash
 python3 service.py --check   # 基础检查
-npm test                     # 契约 + 领域全部 34 个测试
+npm test                     # 契约 + 领域全部 46 个测试
 ```
 
 ## 11. 尚未实现（后续迭代边界）

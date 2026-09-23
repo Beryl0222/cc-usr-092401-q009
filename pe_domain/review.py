@@ -125,14 +125,15 @@ def detect_anomalies(class_id: str, reconstructed: dict) -> list[Anomaly]:
         findings.append(Anomaly(class_id, AnomalyKind.TAKEOVER, evidence,
                                 f"{len(takeovers)} 起连续临时占课"))
 
-    # 签到异常（重复/超时补签）
+    # 签到异常（重复/超时补签/时钟异常）
+    signin_prefixes = ("duplicate_signin", "offline_late", "clock_anomaly")
     signin_hits = sorted(
         occ for occ, flags in flags_by_occasion.items()
-        if any(f.startswith(("duplicate_signin", "offline_late")) for f in flags)
+        if any(f.startswith(signin_prefixes) for f in flags)
     )
     if signin_hits:
         findings.append(Anomaly(class_id, AnomalyKind.SIGNIN, tuple(signin_hits),
-                                f"{len(signin_hits)} 个场次出现重复或超时补签"))
+                                f"{len(signin_hits)} 个场次出现重复、超时补签或时钟异常"))
 
     return findings
 

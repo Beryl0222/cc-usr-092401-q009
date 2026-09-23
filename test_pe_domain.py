@@ -11,6 +11,7 @@ from pe_domain.events import (
     TeacherReport,
     VenueObservation,
     assess_session,
+    parse_aware_iso,
     pseudonym,
 )
 from pe_domain.ledger import EventLedger
@@ -82,8 +83,19 @@ def make_plan(class_ids=("C1",), version=0, status="draft"):
     )
 
 
+def _with_zone(value: str) -> str:
+    """正常用法：给不带时区的钟面时间补 UTC（Z）；已带偏移的原样保留。"""
+    from datetime import datetime
+    text = value[:-1] + "+00:00" if value.endswith(("Z", "z")) else value
+    if datetime.fromisoformat(text).tzinfo is None:
+        return value + "Z"
+    return value
+
+
 def att(token, occ, when, source="online", received=None):
-    return SampleAttendance(occ, token, when, received or when, source)
+    when = _with_zone(when)
+    received = _with_zone(received or when)
+    return SampleAttendance(occ, token, when, received, source)
 
 
 class FixtureTest(unittest.TestCase):
@@ -320,6 +332,138 @@ class ConfirmationTest(unittest.TestCase):
         self.assertTrue(any("补课" in r for r in result.reasons))
 
 
+# ---------------------------------------------------------------- 时区时间线与去重顺序
+
+class TimezoneSigninTest(unittest.TestCase):
+    """跨时区交流周：带偏移 ISO 时间统一到 UTC 时间线，先各自判定再稳定去重。"""
+
+    def setUp(self):
+        self.occ = Occasion("C1-PE-1", 1)
+        self.ven = VenueObservation(self.occ, "V-FIELD", 40)
+
+    def _report(self):
+        return TeacherReport(
+            self.occ, "T-WANG", ActivityKind.PE_CLASS, "BB", 40,
+            SessionMode.NORMAL, "V-FIELD",
+        )
+
+    def _four(self, extra):
+        base = [att("ok1", self.occ, "2026-09-07T10:00:00Z"),
+                att("ok2", self.occ, "2026-09-07T10:00:00Z"),
+                att("ok3", self.occ, "2026-09-07T10:00:00Z")]
+        return base + extra
+
+    def test_parse_aware_iso_unifies_to_utc_timeline(self):
+        from datetime import timezone
+        self.assertEqual(
+            parse_aware_iso("2026-09-07T10:00:00+08:00"),
+            parse_aware_iso("2026-09-07T02:00:00Z"),
+        )
+        self.assertEqual(
+            parse_aware_iso("2026-09-07T10:00:00Z").utcoffset(),
+            timezone.utc.utcoffset(None),
+        )
+        with self.assertRaises(ValueError):
+            parse_aware_iso("2026-09-07T10:00:00")        # 无时区
+        with self.assertRaises(ValueError):
+            parse_aware_iso("2026-13-07T10:00:00+08:00")  # 无法解析（13 月）
+        with self.assertRaises(ValueError):
+            parse_aware_iso("not-a-time")
+
+    def test_cross_midnight_offline_within_window_counts(self):
+        # 23:30 发生、次日 01:00 才收到：跨午夜但只有 1.5 小时
+        late = att("off", self.occ, "2026-09-07T23:30:00Z", source="offline",
+                   received="2026-09-08T01:00:00Z")
+        result = assess_session(self._report(), self.ven, self._four([late]),
+                                HEADCOUNT, {}, {})
+        self.assertTrue(result.confirmed)
+        self.assertNotIn("offline_late:off", result.flags)
+
+    def test_offline_offset_that_naive_clock_face_would_accept_is_rejected(self):
+        # 发生在夏令时 +02，补传收到于冬令时 +01：钟面差正好 48 小时，
+        # 真实 UTC 时间线是 49 小时——按截断钟面会误计入，统一时间线后必须拒绝。
+        late = att("abroad", self.occ, "2026-10-24T10:00:00+02:00",
+                   source="offline", received="2026-10-26T10:00:00+01:00")
+        result = assess_session(self._report(), self.ven, self._four([late]),
+                                HEADCOUNT, {}, {})
+        self.assertFalse(result.confirmed)  # 有效只剩 3 人
+        self.assertIn("offline_late:abroad", result.flags)
+
+    def test_naive_unparseable_and_future_receive_are_rejected(self):
+        bad = [
+            SampleAttendance(self.occ, "naive", "2026-09-07T10:00:00",
+                             "2026-09-07T10:00:00", "online"),
+            SampleAttendance(self.occ, "garbage", "星期一早上",
+                             "2026-09-07T10:00:00Z", "online"),
+            att("future", self.occ, "2026-09-07T10:00:00Z",
+                received="2026-09-07T09:00:00Z"),  # 接收早于发生
+        ]
+        result = assess_session(self._report(), self.ven, self._four(bad),
+                                HEADCOUNT, {}, {})
+        # 三条全部无效：样本仍是 3，达不到 4
+        self.assertFalse(result.confirmed)
+        self.assertIn("clock_anomaly:unparseable:naive", result.flags)
+        self.assertIn("clock_anomaly:unparseable:garbage", result.flags)
+        self.assertIn("clock_anomaly:received_before_occurred:future", result.flags)
+
+    def test_invalid_early_duplicate_never_replaces_valid_record(self):
+        # 合法签到 10:00 已在样本；随后补传一条“发生更早(08:00)但 49 小时后
+        # 才收到”的离线重复——旧逻辑会先用它替换再跳过时限校验，把无效记录
+        # 带回样本；新逻辑先各自判定，无效记录不得参与选取。
+        poisoned = att("dup", self.occ, "2026-09-07T08:00:00Z",
+                        source="offline", received="2026-09-09T09:00:00Z")
+        valid = att("dup", self.occ, "2026-09-07T10:00:00Z")
+        result = assess_session(
+            self._report(), self.ven,
+            self._four([valid, poisoned]), HEADCOUNT, {}, {},
+        )
+        self.assertTrue(result.confirmed)
+        self.assertEqual(result.per_student_minutes.get("dup"), 40)
+        self.assertIn("duplicate_signin:dup", result.flags)
+        self.assertIn("offline_late:dup", result.flags)
+
+    def test_mixed_valid_duplicates_select_earliest_valid_stably(self):
+        # 三条同 token：晚到但有效的在线(11:00)、更早且窗口内的离线(09:00)、
+        # 更早却超窗的离线(07:00)。应选“最早的有效候选”09:00 那条。
+        late_early = att("mix", self.occ, "2026-09-07T07:00:00Z",
+                         source="offline", received="2026-09-09T08:00:00Z")
+        valid_early = att("mix", self.occ, "2026-09-07T09:00:00Z",
+                          source="offline", received="2026-09-07T15:00:00Z")
+        valid_late = att("mix", self.occ, "2026-09-07T11:00:00Z")
+        forward = assess_session(
+            self._report(), self.ven, self._four([valid_late, valid_early, late_early]),
+            HEADCOUNT, {}, {},
+        )
+        reverse = assess_session(
+            self._report(), self.ven, self._four([late_early, valid_early, valid_late]),
+            HEADCOUNT, {}, {},
+        )
+        self.assertTrue(forward.confirmed)
+        self.assertEqual(forward.per_student_minutes["mix"], 40)
+        # 乱序到达：标记与结论完全一致
+        self.assertEqual(forward.flags, reverse.flags)
+        self.assertEqual(forward.confirmed, reverse.confirmed)
+        self.assertIn("duplicate_signin:mix", forward.flags)
+        self.assertIn("offline_late:mix", forward.flags)
+
+    def test_flags_never_leak_real_student_id(self):
+        adaptation = InjuryAdaptation("student-secret-7", "BB", 10, "MED-7")
+        poisoned = SampleAttendance(
+            self.occ, "tok7", "2026-09-07T08:00:00",  # naive，时钟异常
+            "2026-09-07T10:00:00Z", "online",
+        )
+        result = assess_session(
+            self._report(), self.ven, self._four([
+                att("tok7", self.occ, "2026-09-07T10:00:00Z"), poisoned,
+            ]),
+            HEADCOUNT, {"student-secret-7": adaptation}, {"tok7": "student-secret-7"},
+        )
+        joined = " ".join(result.flags) + " " + " ".join(result.reasons)
+        self.assertNotIn("student-secret-7", joined)
+        self.assertIn("clock_anomaly:unparseable:tok7", result.flags)
+        self.assertEqual(result.per_student_minutes["tok7"], 10)  # 适配折减照旧
+
+
 # ---------------------------------------------------------------- 账本还原
 
 class LedgerRebuildTest(unittest.TestCase):
@@ -404,6 +548,125 @@ class LedgerRebuildTest(unittest.TestCase):
         rebuilt = self._rebuild(current_week=1)
         self.assertEqual(rebuilt["states"]["C1-PE-1#w1"], "rescheduled")
         self.assertIn("C1-PE-1#w1", rebuilt["rescheduled"])
+
+    def _record_normal_raw(self, ledger, slot_id, week, tokens=4, when=None):
+        """与 _record_normal 相同，但可写入任意账本（乱序重放用）。"""
+        occ = Occasion(slot_id, week)
+        ledger.append("teacher_report", TeacherReport(
+            occ, "T-WANG", ActivityKind.PE_CLASS, "BB", 40,
+            SessionMode.NORMAL, "V-FIELD"))
+        ledger.append("venue_observation", VenueObservation(occ, "V-FIELD", 40))
+        for i in range(tokens):
+            ledger.append("sample_attendance",
+                          att(f"tok{i}", occ, when or self.when(week)))
+        return occ
+
+    def test_replay_order_does_not_change_confirmation(self):
+        # 同批事件以不同追加顺序构建两个账本，结论必须一致
+        import random
+        payloads: list[tuple[str, object]] = []
+        for w in range(1, 4):
+            for slot in self.slots:
+                occ = Occasion(slot.slot_id, w)
+                payloads.append(("teacher_report", TeacherReport(
+                    occ, "T-WANG", ActivityKind.PE_CLASS, "BB", 40,
+                    SessionMode.NORMAL, "V-FIELD")))
+                payloads.append(("venue_observation",
+                                 VenueObservation(occ, "V-FIELD", 40)))
+                for i in range(4):
+                    payloads.append(("sample_attendance",
+                                     att(f"tok{i}", occ, self.when(w))))
+        # 同一学生在一周内混入更早有效/更晚重复/超窗离线，顺序敏感
+        dup_occ = Occasion("C1-PE-2", 2)
+        payloads += [
+            ("sample_attendance", att("dup", dup_occ, "2026-09-14T11:00:00Z")),
+            ("sample_attendance", att("dup", dup_occ, "2026-09-14T09:00:00Z",
+                                      source="offline",
+                                      received="2026-09-14T15:00:00Z")),
+            ("sample_attendance", att("dup", dup_occ, "2026-09-14T07:00:00Z",
+                                      source="offline",
+                                      received="2026-09-16T08:00:00Z")),
+        ]
+        summaries = []
+        for seed in range(5):
+            shuffled = payloads[:]
+            random.Random(seed).shuffle(shuffled)
+            ledger = EventLedger()
+            for et, p in shuffled:
+                ledger.append(et, p)
+            rebuilt = ledger.rebuild_class(
+                "C1", self.slots, HEADCOUNT, {}, {}, VENUES, current_week=3)
+            summaries.append((
+                rebuilt["states"],
+                tuple((s.occasion.key(), s.confirmed, s.flags) for s in rebuilt["sessions"]),
+            ))
+        first = summaries[0]
+        for other in summaries[1:]:
+            self.assertEqual(other[0], first[0])  # 状态一致
+            self.assertEqual(other[1], first[1])  # 会话/标记一致
+
+    def test_late_offline_arrival_reconfirms_only_that_occasion(self):
+        # 第 1 周先只有 3 个有效样本 -> 周一场次不成立
+        occ = Occasion("C1-PE-1", 1)
+        self.ledger.append("teacher_report", TeacherReport(
+            occ, "T-WANG", ActivityKind.PE_CLASS, "BB", 40,
+            SessionMode.NORMAL, "V-FIELD"))
+        self.ledger.append("venue_observation", VenueObservation(occ, "V-FIELD", 40))
+        for i in range(3):
+            self.ledger.append("sample_attendance",
+                               att(f"tok{i}", occ, self.when(1)))
+        # 同周其他场次正常，作为“未受影响场次”
+        self._record_normal("C1-PE-2", 1)
+        before = self._rebuild(current_week=1)
+        self.assertEqual(before["states"]["C1-PE-1#w1"], "in_review")
+        self.assertEqual(before["states"]["C1-PE-2#w1"], "completed")
+
+        # 第 4 名学生的离线补传在窗口内到达 -> 只重算 C1-PE-1
+        self.ledger.append("sample_attendance",
+                           att("tok3", occ, self.when(1), source="offline",
+                               received="2026-09-02T10:00:00Z"))
+        incremental = self.ledger.reconfirm_occasion(
+            "C1", self.slots, HEADCOUNT, {}, {}, VENUES, 1, before, occ)
+        full = self._rebuild(current_week=1)
+        self.assertEqual(incremental["states"], full["states"])
+        self.assertEqual(incremental["states"]["C1-PE-1#w1"], "completed")
+        # 其他场次结论原样保留
+        self.assertEqual(incremental["states"]["C1-PE-2#w1"], "completed")
+        self.assertEqual(
+            [(s.occasion.key(), s.confirmed, s.per_student) for s in incremental["sessions"]],
+            [(s.occasion.key(), s.confirmed, s.per_student) for s in full["sessions"]],
+        )
+
+    def test_makeup_attendance_backfills_only_original_occasion(self):
+        # 原场次被占课待补；补课场次已安排但缺学生确认
+        original = Occasion("C1-PE-2", 1)
+        makeup = Occasion("C1-PE-1", 2)
+        self._record_normal("C1-PE-1", 1)
+        self.ledger.append("takeover",
+                           {"slot_id": "C1-PE-2", "week": 1, "subject": "数学", "ref": ""})
+        self.ledger.append("makeup_plan", {"occasion": makeup, "makeup_for": original})
+        self.ledger.append("teacher_report", TeacherReport(
+            makeup, "T-WANG", ActivityKind.PE_CLASS, "BB", 40,
+            SessionMode.MAKEUP, "V-GYM", basis_ref="MK-002", makeup_for=original))
+        self.ledger.append("venue_observation", VenueObservation(makeup, "V-GYM", 40))
+        for i in range(3):
+            self.ledger.append("sample_attendance",
+                               att(f"mk{i}", makeup, "2026-09-14T10:00:00Z"))
+        before = self._rebuild(current_week=2)
+        self.assertEqual(before["states"]["C1-PE-2#w1"], "taken_over")
+        self.assertEqual(before["states"]["C1-PE-1#w2"], "in_review")
+
+        # 第 4 名学生补传到补课场次 -> 补课成立，应回填原场次为 completed
+        self.ledger.append("sample_attendance",
+                           att("mk3", makeup, "2026-09-14T10:00:00Z",
+                               source="offline", received="2026-09-15T10:00:00Z"))
+        incremental = self.ledger.reconfirm_occasion(
+            "C1", self.slots, HEADCOUNT, {}, {}, VENUES, 2, before, makeup)
+        full = self._rebuild(current_week=2)
+        self.assertEqual(incremental["states"], full["states"])
+        self.assertEqual(incremental["states"]["C1-PE-1#w2"], "completed_makeup")
+        self.assertEqual(incremental["states"]["C1-PE-2#w1"], "completed")
+        self.assertIn("C1-PE-2#w1", incremental["made_up"])
 
 
 # ---------------------------------------------------------------- 覆盖规则
@@ -512,6 +775,31 @@ class ReviewTest(unittest.TestCase):
         kinds = {a.kind for a in detect_anomalies("C1", rebuilt)}
         self.assertIn(AnomalyKind.TAKEOVER, kinds)
 
+    def test_clock_anomaly_and_late_signin_flagged_for_review(self):
+        ledger = EventLedger()
+        slots = five_pe_slots("C1")
+        occ = Occasion("C1-PE-1", 1)
+        ledger.append("teacher_report", TeacherReport(
+            occ, "T-WANG", ActivityKind.PE_CLASS, "BB", 40,
+            SessionMode.NORMAL, "V-FIELD"))
+        ledger.append("venue_observation", VenueObservation(occ, "V-FIELD", 40))
+        for i in range(4):
+            ledger.append("sample_attendance",
+                          att(f"t{i}", occ, "2026-09-01T10:00:00Z"))
+        # 时钟异常（接收早于发生）与超窗离线各一条，均只留痕
+        ledger.append("sample_attendance",
+                      att("bad-clock", occ, "2026-09-01T10:00:00Z",
+                          received="2026-09-01T09:00:00Z"))
+        ledger.append("sample_attendance",
+                      att("late", occ, "2026-09-01T10:00:00Z", source="offline",
+                          received="2026-09-04T10:00:00Z"))
+        rebuilt = ledger.rebuild_class("C1", slots, HEADCOUNT, {}, {}, VENUES, current_week=1)
+        flags = rebuilt["flags"]["C1-PE-1#w1"]
+        self.assertIn("clock_anomaly:received_before_occurred:bad-clock", flags)
+        self.assertIn("offline_late:late", flags)
+        kinds = {a.kind for a in detect_anomalies("C1", rebuilt)}
+        self.assertIn(AnomalyKind.SIGNIN, kinds)
+
 
 # ---------------------------------------------------------------- 可见性
 
@@ -565,6 +853,49 @@ class VisibilityTest(unittest.TestCase):
         self.assertTrue(summary.published)
         self.assertEqual(summary.classes_counted, 4)
         self.assertAlmostEqual(summary.occasions_completed_ratio, 0.9)
+
+    def test_parent_view_and_coverage_sync_after_late_arrival(self):
+        # 补传修正确认结果后，家长视图与班级覆盖率同步看到修正后的有效时长
+        vault = IdentityVault("salt-2026-1")
+        token = vault.enroll("stu-1")
+        vault.link_parent("parent-cred", "stu-1")
+        ledger = EventLedger()
+        slots = five_pe_slots("C1")
+        occ = Occasion("C1-PE-1", 1)
+        ledger.append("teacher_report", TeacherReport(
+            occ, "T-WANG", ActivityKind.PE_CLASS, "BB", 40,
+            SessionMode.NORMAL, "V-FIELD"))
+        ledger.append("venue_observation", VenueObservation(occ, "V-FIELD", 40))
+        # 该生在线签到 + 2 名同学 -> 3 个有效样本，未达 4 人下限
+        ledger.append("sample_attendance", att(token, occ, "2026-09-01T10:00:00Z"))
+        for i in range(2):
+            ledger.append("sample_attendance",
+                          att(f"peer{i}", occ, "2026-09-01T10:00:00Z"))
+        # 一条超窗离线补传（50 小时）只留痕不计入
+        ledger.append("sample_attendance",
+                      att("peer2", occ, "2026-09-01T10:00:00Z", source="offline",
+                          received="2026-09-03T12:00:00Z"))
+        before = ledger.rebuild_class("C1", slots, HEADCOUNT, {}, vault.token_to_student,
+                                      VENUES, current_week=1)
+        self.assertEqual(before["states"]["C1-PE-1#w1"], "in_review")
+        self.assertIn("offline_late:peer2", before["flags"]["C1-PE-1#w1"])
+        view_before = build_parent_view("parent-cred", vault, {}, before["sessions"])
+        self.assertEqual(view_before.recent_minutes, ())  # 未确认场次不展示
+        cov_before = compute_class_coverage("C1", before, (GOAL_BB,))
+        self.assertEqual(cov_before.in_review, 1)
+
+        # 第 4 名同学的有效离线补传到达 -> 场次成立
+        ledger.append("sample_attendance",
+                      att("peer3", occ, "2026-09-01T10:00:00Z", source="offline",
+                          received="2026-09-02T10:00:00Z"))
+        after = ledger.reconfirm_occasion(
+            "C1", slots, HEADCOUNT, {}, vault.token_to_student, VENUES, 1, before, occ)
+        self.assertEqual(after["states"]["C1-PE-1#w1"], "completed")
+        view_after = build_parent_view("parent-cred", vault, {}, after["sessions"])
+        self.assertEqual(view_after.recent_minutes, (("C1-PE-1#w1", 40, "normal"),))
+        cov_after = compute_class_coverage("C1", after, (GOAL_BB,))
+        self.assertEqual(cov_after.in_review, 0)
+        self.assertEqual(cov_after.completed, 1)
 
 
 if __name__ == "__main__":

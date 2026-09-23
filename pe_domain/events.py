@@ -15,13 +15,18 @@
 
 防虚增：
   - 有效运动时长以“教师申报 × 标准时长上限 × 学生适配”三者取小；
-  - 同一 (学生, 时段场次) 重复签到只计一次，重复事件保留并标记；
+  - 所有签到时间必须是带时区偏移的 ISO 8601 时间，解析后统一到 UTC
+    同一时间线再比较——跨时区记录绝不能按截断后的本地钟面计算；
+  - 同一 (学生, 场次) 的候选先各自判定有效性（无时区/无法解析/接收早于
+    发生/离线超窗均判无效并分类留痕），再按“最早发生、稳定兜底”规则只取
+    一条；重复事件保留并标记，无效记录不会因替换去重被重新带回样本；
   - 离线补签有受理时限，且同样遵循去重，不能把一节课签成多节课。
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from hashlib import blake2b
 
@@ -119,13 +124,65 @@ class ConfirmationResult:
     flags: tuple[str, ...]               # 重复签到、自由活动等关注标记
 
 
-def _hours_between(later_iso: str, earlier_iso: str) -> float:
-    from datetime import datetime
+def parse_aware_iso(value: str) -> datetime:
+    """解析带时区偏移的 ISO 8601 时间并统一到 UTC 时间线。
 
-    fmt = "%Y-%m-%dT%H:%M:%S"
-    later = datetime.strptime(later_iso[:19], fmt)
-    earlier = datetime.strptime(earlier_iso[:19], fmt)
+    无时区信息（naive）或无法解析的时间一律拒绝，由调用方留痕。
+    """
+    if not isinstance(value, str):
+        raise ValueError("时间必须是 ISO 字符串")
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError(f"无法解析的时间：{value!r}") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f"时间缺少时区偏移：{value!r}")
+    return parsed.astimezone(timezone.utc)
+
+
+def _hours_between(later: datetime, earlier: datetime) -> float:
     return (later - earlier).total_seconds() / 3600
+
+
+@dataclass(frozen=True)
+class _Candidate:
+    """一条签到候选的有效性判定结果（同一生同一场次可有多条）。"""
+
+    att: SampleAttendance
+    occurred: datetime
+    received: datetime
+    valid: bool
+    issue: str = ""  # clock_bad / received_before_occurred / offline_late
+
+
+def _evaluate_candidate(att: SampleAttendance) -> _Candidate:
+    """先独立判定：时间可解析、带时区、接收不早于发生、离线补签在窗口内。
+
+    判定只依赖候选自身，与候选到达顺序无关，保证重放顺序变化不改变结果。
+    """
+    try:
+        occurred = parse_aware_iso(att.occurred_at)
+    except ValueError as exc:
+        return _Candidate(att, datetime.min.replace(tzinfo=timezone.utc),
+                          datetime.min.replace(tzinfo=timezone.utc), False,
+                          f"clock_bad:{exc}")
+    try:
+        received = parse_aware_iso(att.received_at)
+    except ValueError as exc:
+        return _Candidate(att, occurred, datetime.min.replace(tzinfo=timezone.utc),
+                          False, f"clock_bad:{exc}")
+    if received < occurred:
+        return _Candidate(att, occurred, received, False,
+                          "received_before_occurred")
+    if att.source == "offline":
+        delay = _hours_between(received, occurred)
+        if delay > OFFLINE_ACCEPT_HOURS:
+            return _Candidate(att, occurred, received, False,
+                              f"offline_late:{delay:.1f}h")
+    return _Candidate(att, occurred, received, True)
 
 
 def assess_session(
@@ -146,26 +203,42 @@ def assess_session(
     flags: list[str] = []
     occ = report.occasion
 
-    # ---- 学生侧：去重 + 离线时限 ----
-    unique: dict[str, SampleAttendance] = {}
-    duplicate_tokens: set[str] = set()
+    # ---- 学生侧：先各自判定有效，再按稳定规则去重 ----
+    # 每 (token) 一组候选：组内先独立判有效（时钟/时限各自留痕），
+    # 有效候选中按 (发生时刻, 接收时刻, 设备号) 稳定取最早一条；
+    # 无效候选绝不因替换去重被带回样本。判定与遍历顺序无关，重放可重入。
+    candidates: dict[str, list[_Candidate]] = {}
     for att in attendances:
         if att.occasion != occ:
             continue
-        if att.token in unique:
-            # 重复签到：保留最早一条，重复仅标记，绝不增加时长
-            duplicate_tokens.add(att.token)
-            if att.occurred_at < unique[att.token].occurred_at:
-                unique[att.token] = att
+        candidates.setdefault(att.token, []).append(_evaluate_candidate(att))
+
+    unique: dict[str, SampleAttendance] = {}
+    for token in sorted(candidates):
+        group = candidates[token]
+        valid = [c for c in group if c.valid]
+        # 重复、迟到、时钟异常分别留痕（账本里只有 token，不泄露真实学号）；
+        # 无效标记按类别排序后输出，与候选到达顺序无关
+        if len(group) > 1:
+            flags.append(f"duplicate_signin:{token}")
+        invalid_flags: list[str] = []
+        for c in group:
+            if c.valid:
+                continue
+            if c.issue.startswith("offline_late:"):
+                invalid_flags.append(f"offline_late:{token}")
+            elif c.issue == "received_before_occurred":
+                invalid_flags.append(f"clock_anomaly:received_before_occurred:{token}")
+            else:
+                invalid_flags.append(f"clock_anomaly:unparseable:{token}")
+        flags.extend(sorted(invalid_flags))
+        if not valid:
             continue
-        if att.source == "offline":
-            delay = _hours_between(att.received_at, att.occurred_at)
-            if delay > OFFLINE_ACCEPT_HOURS:
-                flags.append(f"offline_late:{att.token}")
-                continue  # 超时限：留痕于账本但不计入
-        unique[att.token] = att
-    for token in sorted(duplicate_tokens):
-        flags.append(f"duplicate_signin:{token}")
+        chosen = min(
+            valid,
+            key=lambda c: (c.occurred, c.received, c.att.device_id, c.att.source),
+        ).att
+        unique[token] = chosen
 
     # ---- 三方：学生样本量 ----
     required = max(MIN_SAMPLE_COUNT, int(class_headcount * MIN_SAMPLE_RATIO + 0.999))
@@ -213,7 +286,7 @@ def assess_session(
 
     # ---- 每生时长：伤病适配折减（只对抽样确认到的学生出结果）----
     per_student: dict[str, int] = {}
-    for token in unique:
+    for token in sorted(unique):
         student_id = token_to_student.get(token)
         adapted = adaptations.get(student_id) if student_id else None
         if adapted is not None and adapted.skill_code == report.taught_skill:

@@ -12,10 +12,14 @@
 - weather_trigger（降雨/高温触发，关联预案）
 - makeup_plan（补课安排，挂接缺课场次）
 - review_resolved（教研结论）
+
+重放顺序无关：账本先把事件整理成以 Occasion 为键的索引（dict/set），
+确认与状态推导只依赖“最终事件集合”，补传乱序到达不改变结论。
 """
 
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -28,7 +32,7 @@ from .events import (
     VenueObservation,
     assess_session,
 )
-from .models import STANDARD_MINUTES, ActivityKind
+from .models import ActivityKind
 
 
 @dataclass(frozen=True)
@@ -69,40 +73,23 @@ class EventLedger:
         return tuple(e for e in self._entries if e.event_type == event_type)
 
     # ------------------------------------------------------------------
-    def rebuild_class(
-        self,
-        class_id: str,
-        class_slots,
-        class_headcount: int,
-        adaptations: dict,
-        token_to_student: dict[str, str],
-        venues: dict,
-        current_week: int,
-        *,
-        assessor: Callable[..., ConfirmationResult] = assess_session,
-    ) -> dict:
-        """重放账本，还原单班实况。
+    def _index_events(self, slot_ids: set[str]) -> dict:
+        """把账本整理为以 Occasion 为键的索引。
 
-        class_slots: 该班的 PlanSlot 集合（生效方案版本）。
-        返回结构化实况：场次状态、会话、缺课、补课挂接、调课、占课、标记。
+        同场次重复教师记录以最后追加的一条为准（实课一场只有一条教师记录）；
+        其余结构均为 dict/set，结论只取决于最终事件集合而非到达顺序。
         """
-        from collections import defaultdict
-
-        # 展开计划场次（只核对到当前教学周；未来周次不算缺口）
-        plan_week = current_week
         reports: dict[Occasion, TeacherReport] = {}
         observations: dict[Occasion, VenueObservation] = {}
         attendances: dict[Occasion, list[SampleAttendance]] = defaultdict(list)
-        rescheduled: dict[Occasion, str] = {}   # -> 依据
+        rescheduled: dict[Occasion, str] = {}      # -> 依据
         takeovers: list[dict] = []
         makeup_links: dict[Occasion, Occasion] = {}  # 原场次 -> 补课场次
         weather: dict[Occasion, str] = {}
-
-        slot_ids = {s.slot_id for s in class_slots}
+        conflicts: set[Occasion] = set()
 
         for entry in self._entries:
-            p = entry.payload
-            et = entry.event_type
+            p, et = entry.payload, entry.event_type
             if et == "teacher_report" and p.occasion.slot_id in slot_ids:
                 reports[p.occasion] = p
             elif et == "venue_observation" and p.occasion.slot_id in slot_ids:
@@ -115,9 +102,129 @@ class EventLedger:
                 takeovers.append(p)
             elif et == "weather_trigger" and p["occasion"].slot_id in slot_ids:
                 weather[p["occasion"]] = p["policy_ref"]
-            elif et == "makeup_plan":
-                if p["makeup_for"].slot_id in slot_ids:
-                    makeup_links[p["makeup_for"]] = p["occasion"]
+            elif et == "venue_conflict_reported" and p["occasion"].slot_id in slot_ids:
+                conflicts.add(p["occasion"])
+            elif et == "makeup_plan" and p["makeup_for"].slot_id in slot_ids:
+                makeup_links[p["makeup_for"]] = p["occasion"]
+
+        return {
+            "reports": reports,
+            "observations": observations,
+            "attendances": dict(attendances),
+            "rescheduled": rescheduled,
+            "takeovers": takeovers,
+            "makeup_links": makeup_links,
+            "weather": weather,
+            "conflicts": conflicts,
+        }
+
+    # ------------------------------------------------------------------
+    def rebuild_class(
+        self,
+        class_id: str,
+        class_slots,
+        class_headcount: int,
+        adaptations: dict,
+        token_to_student: dict[str, str],
+        venues: dict,
+        current_week: int,
+        *,
+        assessor: Callable[..., ConfirmationResult] = assess_session,
+        cached_results: dict[Occasion, ConfirmationResult] | None = None,
+    ) -> dict:
+        """重放账本，还原单班实况。
+
+        class_slots: 该班的 PlanSlot 集合（生效方案版本）。
+        cached_results: 场次 -> 已算好的 ConfirmationResult（增量重算时复用
+        未受影响场次的结论）；缺省/缺失的场次照常重新确认。
+        """
+        slot_ids = {s.slot_id for s in class_slots}
+        index = self._index_events(slot_ids)
+
+        results: dict[Occasion, ConfirmationResult] = {}
+        for occ in index["reports"]:
+            if cached_results is not None and occ in cached_results:
+                results[occ] = cached_results[occ]
+                continue
+            results[occ] = assessor(
+                index["reports"][occ],
+                index["observations"].get(occ),
+                index["attendances"].get(occ, []),
+                class_headcount, adaptations, token_to_student,
+            )
+
+        return self._assemble(
+            class_id=class_id, class_slots=class_slots, venues=venues,
+            plan_week=current_week, index=index, results=results,
+        )
+
+    # ------------------------------------------------------------------
+    def reconfirm_occasion(
+        self,
+        class_id: str,
+        class_slots,
+        class_headcount: int,
+        adaptations: dict,
+        token_to_student: dict[str, str],
+        venues: dict,
+        current_week: int,
+        previous: dict,
+        occasion: Occasion,
+        *,
+        assessor: Callable[..., ConfirmationResult] = assess_session,
+    ) -> dict:
+        """补传到达后只重算对应场次（含补课挂接两端），其余场次沿用旧结论。
+
+        previous 为该班最近一次 rebuild_class()/reconfirm_occasion() 的结果。
+        本方法的输出必须与对当前账本全量 rebuild_class() 完全一致——
+        增量只省确认计算，不改变任何派生状态。
+        """
+        slot_ids = {s.slot_id for s in class_slots}
+        index = self._index_events(slot_ids)
+
+        # 受影响场次：补传目标本身 + 与它有补课挂接的场次（补课确认会回填原场次）
+        affected: set[Occasion] = {occasion}
+        for original, makeup in index["makeup_links"].items():
+            if original == occasion:
+                affected.add(makeup)
+            if makeup == occasion:
+                affected.add(original)
+
+        cached: dict[Occasion, ConfirmationResult] = {}
+        for s in previous["sessions"]:
+            if s.occasion in affected:
+                continue
+            cached[s.occasion] = ConfirmationResult(
+                occasion=s.occasion, confirmed=s.confirmed, mode=s.mode,
+                effective_minutes=s.minutes, per_student_minutes=s.per_student,
+                reasons=s.reasons, flags=s.flags,
+            )
+
+        return self.rebuild_class(
+            class_id, class_slots, class_headcount, adaptations,
+            token_to_student, venues, current_week,
+            assessor=assessor, cached_results=cached,
+        )
+
+    # ------------------------------------------------------------------
+    def _assemble(
+        self,
+        *,
+        class_id: str,
+        class_slots,
+        venues: dict,
+        plan_week: int,
+        index: dict,
+        results: dict[Occasion, ConfirmationResult],
+    ) -> dict:
+        """由事件索引 + 每场确认结果推导场次状态。纯函数，可安全增量复用。"""
+        reports = index["reports"]
+        observations = index["observations"]
+        rescheduled = index["rescheduled"]
+        takeovers = index["takeovers"]
+        makeup_links = index["makeup_links"]
+        weather = index["weather"]
+        conflicts = index["conflicts"]
 
         sessions: list[ReconstructedSession] = []
         occasion_states: dict[str, str] = {}
@@ -125,30 +232,20 @@ class EventLedger:
         takeover_keys = {Occasion(t["slot_id"], t["week"]).key() for t in takeovers}
         flags_index: dict[str, tuple[str, ...]] = {}
 
-        # 按场次做三方确认
+        # 按场次做三方确认（场次顺序固定：周次 -> slot_id）
         for occ, report in sorted(reports.items(), key=lambda kv: (kv[0].week, kv[0].slot_id)):
+            result = results[occ]
             notes: list[str] = []
             obs = observations.get(occ)
             if obs is not None:
                 venue = venues.get(obs.venue_id)
                 if venue is not None and obs.observed_headcount > venue.safe_capacity:
                     notes.append("capacity_breach")
-            result = assessor(
-                report, obs, attendances.get(occ, []),
-                class_headcount, adaptations, token_to_student,
-            )
+            if occ in conflicts:
+                notes.append("venue_conflict_actual")
+
             key = occ.key()
             flags_index[key] = result.flags
-
-            # 实际场地冲突：同一场地同一时刻出现他班观测（在全局视图中检查，
-            # 这里通过账本做简化判定：venue_conflict_reported 事件）
-            for entry in self._entries:
-                if (
-                    entry.event_type == "venue_conflict_reported"
-                    and entry.payload["occasion"] == occ
-                ):
-                    notes.append("venue_conflict_actual")
-
             sessions.append(ReconstructedSession(
                 occasion=occ, class_id=class_id, kind=report.kind,
                 taught_skill=report.taught_skill, mode=report.mode,
