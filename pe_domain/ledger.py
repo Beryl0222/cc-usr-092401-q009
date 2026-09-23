@@ -3,6 +3,8 @@
 连续发生“场地冲突 → 临时占课 → 离线补签”后，仍能按时间顺序重放事件，
 还原每个班真正完成的内容、缺口与补课安排。账本只追加、不修改不删除；
 所有判定（确认、异常、覆盖）都是重放的派生结果，可随时重新计算。
+重放结果与事件到达顺序无关；补传到达后可用 rebuild_occasion 只重算
+对应场次，其结果与全量重放逐场一致（二者共用同一段构造逻辑）。
 
 事件类型：
 
@@ -69,6 +71,87 @@ class EventLedger:
         return tuple(e for e in self._entries if e.event_type == event_type)
 
     # ------------------------------------------------------------------
+    def _session_notes(self, occ: Occasion, obs, venues: dict) -> tuple[str, ...]:
+        """单场次的附加留痕：实际容量超限、实际场地冲突。"""
+        notes: list[str] = []
+        if obs is not None:
+            venue = venues.get(obs.venue_id)
+            if venue is not None and obs.observed_headcount > venue.safe_capacity:
+                notes.append("capacity_breach")
+        # 实际场地冲突：同一场地同一时刻出现他班观测（在全局视图中检查，
+        # 这里通过账本做简化判定：venue_conflict_reported 事件）
+        for entry in self._entries:
+            if (
+                entry.event_type == "venue_conflict_reported"
+                and entry.payload["occasion"] == occ
+            ):
+                notes.append("venue_conflict_actual")
+        return tuple(notes)
+
+    def _assess_occasion(
+        self,
+        class_id: str,
+        occ: Occasion,
+        report: TeacherReport,
+        obs,
+        atts: list[SampleAttendance],
+        class_headcount: int,
+        adaptations: dict,
+        token_to_student: dict[str, str],
+        venues: dict,
+        assessor: Callable[..., ConfirmationResult],
+    ) -> ReconstructedSession:
+        """对单个场次做三方确认并构造重放会话（全量/增量重算共用）。"""
+        result = assessor(
+            report, obs, atts, class_headcount, adaptations, token_to_student,
+        )
+        return ReconstructedSession(
+            occasion=occ, class_id=class_id, kind=report.kind,
+            taught_skill=report.taught_skill, mode=report.mode,
+            minutes=result.effective_minutes, confirmed=result.confirmed,
+            reasons=result.reasons, flags=result.flags,
+            notes=self._session_notes(occ, obs, venues),
+            makeup_for=report.makeup_for,
+            per_student=result.per_student_minutes,
+        )
+
+    def rebuild_occasion(
+        self,
+        class_id: str,
+        occasion: Occasion,
+        class_headcount: int,
+        adaptations: dict,
+        token_to_student: dict[str, str],
+        venues: dict,
+        *,
+        assessor: Callable[..., ConfirmationResult] = assess_session,
+    ) -> Optional[ReconstructedSession]:
+        """补传到达后只重算对应场次，不必整班重放。
+
+        occasion 须属于该班（slot 命名空间按班隔离，同 rebuild_class）。
+        结果与 rebuild_class 对同一场次的输出一致；该场次没有教师记录
+        （未进入三方确认）时返回 None。
+        """
+        report: Optional[TeacherReport] = None
+        obs: Optional[VenueObservation] = None
+        atts: list[SampleAttendance] = []
+        for entry in self._entries:
+            p = entry.payload
+            et = entry.event_type
+            if et == "teacher_report" and p.occasion == occasion:
+                report = p
+            elif et == "venue_observation" and p.occasion == occasion:
+                obs = p
+            elif et == "sample_attendance" and p.occasion == occasion:
+                atts.append(p)
+        if report is None:
+            return None
+        return self._assess_occasion(
+            class_id, occasion, report, obs, atts,
+            class_headcount, adaptations, token_to_student, venues, assessor,
+        )
+
+    # ------------------------------------------------------------------
     def rebuild_class(
         self,
         class_id: str,
@@ -127,37 +210,15 @@ class EventLedger:
 
         # 按场次做三方确认
         for occ, report in sorted(reports.items(), key=lambda kv: (kv[0].week, kv[0].slot_id)):
-            notes: list[str] = []
             obs = observations.get(occ)
-            if obs is not None:
-                venue = venues.get(obs.venue_id)
-                if venue is not None and obs.observed_headcount > venue.safe_capacity:
-                    notes.append("capacity_breach")
-            result = assessor(
-                report, obs, attendances.get(occ, []),
-                class_headcount, adaptations, token_to_student,
+            session = self._assess_occasion(
+                class_id, occ, report, obs, attendances.get(occ, []),
+                class_headcount, adaptations, token_to_student, venues, assessor,
             )
             key = occ.key()
-            flags_index[key] = result.flags
-
-            # 实际场地冲突：同一场地同一时刻出现他班观测（在全局视图中检查，
-            # 这里通过账本做简化判定：venue_conflict_reported 事件）
-            for entry in self._entries:
-                if (
-                    entry.event_type == "venue_conflict_reported"
-                    and entry.payload["occasion"] == occ
-                ):
-                    notes.append("venue_conflict_actual")
-
-            sessions.append(ReconstructedSession(
-                occasion=occ, class_id=class_id, kind=report.kind,
-                taught_skill=report.taught_skill, mode=report.mode,
-                minutes=result.effective_minutes, confirmed=result.confirmed,
-                reasons=result.reasons, flags=result.flags,
-                notes=tuple(notes), makeup_for=report.makeup_for,
-                per_student=result.per_student_minutes,
-            ))
-            if result.confirmed:
+            flags_index[key] = session.flags
+            sessions.append(session)
+            if session.confirmed:
                 if report.mode == SessionMode.MAKEUP and report.makeup_for is not None:
                     occasion_states[report.makeup_for.key()] = "completed"
                     made_up.add(report.makeup_for.key())

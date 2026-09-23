@@ -227,8 +227,8 @@ class ConfirmationTest(unittest.TestCase):
             self._report(),
             VenueObservation(self.occ, "V-FIELD", 40),
             [
-                att("late", self.occ, self.when, source="offline",
-                    received="2026-09-09T11:00:00"),  # 49 小时后
+                att("late", self.occ, "2026-09-07T10:00:00+08:00", source="offline",
+                    received="2026-09-09T11:00:00+08:00"),  # 49 小时后
                 att("ok1", self.occ, self.when),
                 att("ok2", self.occ, self.when),
                 att("ok3", self.occ, self.when),
@@ -243,8 +243,8 @@ class ConfirmationTest(unittest.TestCase):
             self._report(),
             VenueObservation(self.occ, "V-FIELD", 40),
             [
-                att("off", self.occ, self.when, source="offline",
-                    received="2026-09-08T15:00:00"),  # 29 小时后
+                att("off", self.occ, "2026-09-07T10:00:00+08:00", source="offline",
+                    received="2026-09-08T15:00:00+08:00"),  # 29 小时后
                 att("ok1", self.occ, self.when),
                 att("ok2", self.occ, self.when),
                 att("ok3", self.occ, self.when),
@@ -318,6 +318,280 @@ class ConfirmationTest(unittest.TestCase):
         )
         self.assertFalse(result.confirmed)
         self.assertTrue(any("补课" in r for r in result.reasons))
+
+
+# ---------------------------------------------------------------- 跨时区签到与去重
+
+class CrossTimezoneSigninTest(unittest.TestCase):
+    """跨时区交流周：带偏移的离线补传按统一时间线核算，去重先判定再选取。"""
+
+    def setUp(self):
+        self.occ = Occasion("C1-PE-1", 1)
+
+    def _report(self, **kw):
+        return TeacherReport(
+            self.occ, "T-WANG", ActivityKind.PE_CLASS, "BB", 40,
+            SessionMode.NORMAL, "V-FIELD", **kw,
+        )
+
+    def _assess(self, attendances, **kw):
+        return assess_session(
+            self._report(), VenueObservation(self.occ, "V-FIELD", 40),
+            attendances, HEADCOUNT, kw.get("adaptations", {}),
+            kw.get("token_to_student", {}),
+        )
+
+    def test_offline_offset_beyond_window_rejected(self):
+        # 发生 10:00+08:00 = 02:00Z，接收 09:00Z -> 实际 55 小时，超过 48 小时窗口；
+        # 旧逻辑截断时区按本地钟面得 47 小时，会错误计入
+        result = self._assess([
+            att("late1", self.occ, "2026-09-07T10:00:00+08:00", source="offline",
+                received="2026-09-09T09:00:00+00:00"),
+            att("ok1", self.occ, "2026-09-07T10:00:00+08:00"),
+            att("ok2", self.occ, "2026-09-07T10:00:00+08:00"),
+            att("ok3", self.occ, "2026-09-07T10:00:00+08:00"),
+            att("ok4", self.occ, "2026-09-07T10:00:00+08:00"),
+        ])
+        self.assertTrue(result.confirmed)  # 其余 4 个有效样本足够
+        self.assertNotIn("late1", result.per_student_minutes)
+        self.assertIn("offline_late:late1", result.flags)
+
+    def test_offline_offset_within_window_counted(self):
+        # 发生 10:00-08:00 = 18:00Z，接收 11:00Z -> 实际 41 小时，在窗口内；
+        # 旧逻辑截断时区得 49 小时，会错误拒绝
+        result = self._assess([
+            att("off1", self.occ, "2026-09-07T10:00:00-08:00", source="offline",
+                received="2026-09-09T11:00:00+00:00"),
+            att("ok1", self.occ, "2026-09-07T10:00:00+08:00"),
+            att("ok2", self.occ, "2026-09-07T10:00:00+08:00"),
+            att("ok3", self.occ, "2026-09-07T10:00:00+08:00"),
+        ])
+        self.assertTrue(result.confirmed)
+        self.assertIn("off1", result.per_student_minutes)
+
+    def test_offline_without_timezone_rejected(self):
+        result = self._assess([
+            att("naive1", self.occ, "2026-09-07T10:00:00", source="offline",
+                received="2026-09-08T10:00:00"),  # 离线补传不带偏移
+            att("ok1", self.occ, "2026-09-07T10:00:00+08:00"),
+            att("ok2", self.occ, "2026-09-07T10:00:00+08:00"),
+            att("ok3", self.occ, "2026-09-07T10:00:00+08:00"),
+            att("ok4", self.occ, "2026-09-07T10:00:00+08:00"),
+        ])
+        self.assertTrue(result.confirmed)
+        self.assertNotIn("naive1", result.per_student_minutes)
+        self.assertIn("clock_anomaly:naive1:missing_timezone", result.flags)
+
+    def test_unparseable_time_rejected(self):
+        result = self._assess([
+            att("bad1", self.occ, "not-a-time", source="offline",
+                received="2026-09-07T10:00:00+08:00"),
+            att("ok1", self.occ, "2026-09-07T10:00:00+08:00"),
+            att("ok2", self.occ, "2026-09-07T10:00:00+08:00"),
+            att("ok3", self.occ, "2026-09-07T10:00:00+08:00"),
+            att("ok4", self.occ, "2026-09-07T10:00:00+08:00"),
+        ])
+        self.assertNotIn("bad1", result.per_student_minutes)
+        self.assertIn("clock_anomaly:bad1:unparseable_time", result.flags)
+
+    def test_received_before_occurred_rejected(self):
+        result = self._assess([
+            att("skew1", self.occ, "2026-09-07T10:00:00+08:00", source="offline",
+                received="2026-09-07T09:00:00+08:00"),  # 接收早于发生
+            att("ok1", self.occ, "2026-09-07T10:00:00+08:00"),
+            att("ok2", self.occ, "2026-09-07T10:00:00+08:00"),
+            att("ok3", self.occ, "2026-09-07T10:00:00+08:00"),
+            att("ok4", self.occ, "2026-09-07T10:00:00+08:00"),
+        ])
+        self.assertNotIn("skew1", result.per_student_minutes)
+        self.assertIn("clock_anomaly:skew1:received_before_occurred", result.flags)
+
+    def test_cross_midnight_offline_counts(self):
+        # 跨午夜：发生 23:50+08:00，次日 00:10+08:00 接收 -> 24 小时 20 分，有效
+        result = self._assess([
+            att("mid1", self.occ, "2026-09-07T23:50:00+08:00", source="offline",
+                received="2026-09-09T00:10:00+08:00"),
+            att("ok1", self.occ, "2026-09-07T10:00:00+08:00"),
+            att("ok2", self.occ, "2026-09-07T10:00:00+08:00"),
+            att("ok3", self.occ, "2026-09-07T10:00:00+08:00"),
+        ])
+        self.assertTrue(result.confirmed)
+        self.assertIn("mid1", result.per_student_minutes)
+
+    def test_dst_spring_forward_boundary(self):
+        # 美东夏令时开始（2026-03-08 02:00 EST->EDT）：
+        # 实际 47.5 小时（有效），按本地钟面算是 48.5 小时（会误拒）
+        result = self._assess([
+            att("dst1", self.occ, "2026-03-07T09:30:00-05:00", source="offline",
+                received="2026-03-09T10:00:00-04:00"),
+            att("ok1", self.occ, "2026-03-07T10:00:00-05:00"),
+            att("ok2", self.occ, "2026-03-07T10:00:00-05:00"),
+            att("ok3", self.occ, "2026-03-07T10:00:00-05:00"),
+        ])
+        self.assertTrue(result.confirmed)
+        self.assertIn("dst1", result.per_student_minutes)
+
+    def test_dst_fall_back_boundary(self):
+        # 美东夏令时结束（2026-11-01 02:00 EDT->EST）：
+        # 实际 48.5 小时（超窗），按本地钟面算是 47.5 小时（会误收）
+        result = self._assess([
+            att("dst2", self.occ, "2026-11-01T10:00:00-04:00", source="offline",
+                received="2026-11-03T09:30:00-05:00"),
+            att("ok1", self.occ, "2026-11-01T10:00:00-04:00"),
+            att("ok2", self.occ, "2026-11-01T10:00:00-04:00"),
+            att("ok3", self.occ, "2026-11-01T10:00:00-04:00"),
+            att("ok4", self.occ, "2026-11-01T10:00:00-04:00"),
+        ])
+        self.assertTrue(result.confirmed)
+        self.assertNotIn("dst2", result.per_student_minutes)
+        self.assertIn("offline_late:dst2", result.flags)
+
+    def test_invalid_duplicate_does_not_replace_valid_record(self):
+        # 有效在线记录先到；随后补传一条“更早发生、更晚收到”的无效重复，
+        # 旧去重会先替换最早时间再跳过时限校验，把无效记录带回样本
+        result = self._assess([
+            att("tokA", self.occ, "2026-09-07T10:00:00+08:00"),
+            att("tokA", self.occ, "2026-09-07T09:30:00+08:00", source="offline",
+                received="2026-09-10T10:00:00+08:00"),  # 迟到 72 小时，无效
+            att("tokB", self.occ, "2026-09-07T10:00:00+08:00"),
+            att("tokC", self.occ, "2026-09-07T10:00:00+08:00"),
+            att("tokD", self.occ, "2026-09-07T10:00:00+08:00"),
+        ])
+        self.assertTrue(result.confirmed)
+        self.assertEqual(len(result.per_student_minutes), 4)  # tokA 只计一次
+        # 选中的仍是有效在线记录（10:00+08:00 -> 02:00Z），不是无效重复
+        self.assertEqual(result.selected_occurred["tokA"], "2026-09-07T02:00:00+00:00")
+        self.assertIn("duplicate_signin:tokA", result.flags)
+        self.assertIn("offline_late:tokA", result.flags)  # 迟到重复同样留痕
+
+    def test_mixed_duplicates_validated_then_selected(self):
+        # 混合候选：1 条在线 + 1 条有效离线（更早发生）+ 1 条无效离线（最早发生但迟到）
+        result = self._assess([
+            att("tokM", self.occ, "2026-09-07T10:05:00+08:00"),
+            att("tokM", self.occ, "2026-09-07T09:50:00+08:00", source="offline",
+                received="2026-09-08T10:00:00+08:00"),   # 有效，更早发生
+            att("tokM", self.occ, "2026-09-07T09:40:00+08:00", source="offline",
+                received="2026-09-11T10:00:00+08:00"),   # 迟到，无效
+            att("tokB", self.occ, "2026-09-07T10:00:00+08:00"),
+            att("tokC", self.occ, "2026-09-07T10:00:00+08:00"),
+            att("tokD", self.occ, "2026-09-07T10:00:00+08:00"),
+        ])
+        self.assertTrue(result.confirmed)
+        self.assertEqual(len(result.per_student_minutes), 4)
+        # 稳定规则：统一时间线上“最早的有效”记录（09:50+08:00 -> 01:50Z）
+        self.assertEqual(result.selected_occurred["tokM"], "2026-09-07T01:50:00+00:00")
+        self.assertIn("duplicate_signin:tokM", result.flags)
+        self.assertIn("offline_late:tokM", result.flags)
+
+    def test_replay_order_does_not_change_confirmation(self):
+        records = [
+            att("tokA", self.occ, "2026-09-07T10:05:00+08:00"),
+            att("tokA", self.occ, "2026-09-07T09:50:00+08:00", source="offline",
+                received="2026-09-08T10:00:00+08:00"),
+            att("tokA", self.occ, "2026-09-07T09:40:00+08:00", source="offline",
+                received="2026-09-11T10:00:00+08:00"),
+            att("tokB", self.occ, "2026-09-07T10:00:00+08:00"),
+            att("tokC", self.occ, "2026-09-07T10:00:00Z"),
+            att("tokD", self.occ, "2026-09-07T10:00:00"),
+            att("tokE", self.occ, "2026-09-07T10:00:00", source="offline",
+                received="2026-09-08T10:00:00"),          # 离线无偏移，无效
+            att("tokF", self.occ, "garbage", source="offline",
+                received="2026-09-07T10:00:00+08:00"),    # 无法解析，无效
+        ]
+        orderings = [
+            records,
+            list(reversed(records)),
+            records[3:] + records[:3],
+        ]
+        results = [self._assess(list(order)) for order in orderings]
+        for r in results[1:]:
+            self.assertEqual(results[0], r)  # 确认结果与到达顺序无关
+        self.assertTrue(results[0].confirmed)
+        self.assertEqual(len(results[0].per_student_minutes), 4)
+
+        # 账本级乱序重放：同一批事件不同追加顺序，重建结果一致
+        slots = five_pe_slots("C1")
+        rebuilt = []
+        for order in orderings:
+            ledger = EventLedger()
+            ledger.append("teacher_report", self._report())
+            ledger.append("venue_observation", VenueObservation(self.occ, "V-FIELD", 40))
+            for record in order:
+                ledger.append("sample_attendance", record)
+            rebuilt.append(ledger.rebuild_class(
+                "C1", slots, HEADCOUNT, {}, {}, VENUES, current_week=1))
+        self.assertEqual(rebuilt[0], rebuilt[1])
+        self.assertEqual(rebuilt[0], rebuilt[2])
+
+    def test_late_upload_recomputes_single_occasion_and_views_sync(self):
+        vault = IdentityVault("salt-sync")
+        tokens = [vault.enroll(f"student-{i}") for i in range(1, 5)]
+        vault.link_parent("parent-4-cred", "student-4")
+
+        ledger = EventLedger()
+        slots = five_pe_slots("C1")
+        occ = Occasion("C1-PE-1", 1)
+        ledger.append("teacher_report", TeacherReport(
+            occ, "T-WANG", ActivityKind.PE_CLASS, "BB", 40,
+            SessionMode.NORMAL, "V-FIELD"))
+        ledger.append("venue_observation", VenueObservation(occ, "V-FIELD", 40))
+        for token in tokens[:3]:  # 差 1 个样本，场次待确认
+            ledger.append("sample_attendance",
+                          att(token, occ, "2026-09-07T10:00:00+08:00"))
+
+        rebuilt1 = ledger.rebuild_class("C1", slots, HEADCOUNT, {}, {}, VENUES, current_week=1)
+        self.assertEqual(rebuilt1["states"]["C1-PE-1#w1"], "in_review")
+        view_before = build_parent_view("parent-4-cred", vault, {}, rebuilt1["sessions"])
+        self.assertEqual(view_before.recent_minutes, ())  # 未确认不出结论
+
+        # 补传到达（离线、带偏移、窗口内）-> 只重算对应场次
+        ledger.append("sample_attendance", att(
+            tokens[3], occ, "2026-09-07T10:02:00+08:00", source="offline",
+            received="2026-09-08T09:00:00+08:00"))
+        session = ledger.rebuild_occasion("C1", occ, HEADCOUNT, {}, {}, VENUES)
+        self.assertTrue(session.confirmed)
+        self.assertEqual(session.minutes, 40)
+        self.assertEqual(session.per_student[tokens[3]], 40)
+        # 没有教师记录的场次不重算
+        self.assertIsNone(ledger.rebuild_occasion(
+            "C1", Occasion("C1-PE-2", 1), HEADCOUNT, {}, {}, VENUES))
+
+        # 增量重算与全量重放逐场一致，且其他场次不受影响
+        rebuilt2 = ledger.rebuild_class("C1", slots, HEADCOUNT, {}, {}, VENUES, current_week=1)
+        full_session = next(s for s in rebuilt2["sessions"] if s.occasion == occ)
+        self.assertEqual(session, full_session)
+        self.assertEqual(rebuilt2["states"]["C1-PE-1#w1"], "completed")
+        others1 = {k: v for k, v in rebuilt1["states"].items() if k != "C1-PE-1#w1"}
+        others2 = {k: v for k, v in rebuilt2["states"].items() if k != "C1-PE-1#w1"}
+        self.assertEqual(others1, others2)
+
+        # 家长视图与班级覆盖率同步看到修正后的有效时长
+        view_after = build_parent_view("parent-4-cred", vault, {}, rebuilt2["sessions"])
+        self.assertEqual(view_after.recent_minutes, (("C1-PE-1#w1", 40, "normal"),))
+        coverage = compute_class_coverage("C1", rebuilt2, (GOAL_BB,))
+        self.assertEqual(coverage.completed, 1)
+        self.assertTrue(coverage.skill_coverage[0].taught)
+
+    def test_flags_never_expose_real_student_ids(self):
+        adaptation = InjuryAdaptation("student-001", "BB", 10, "MED-1")
+        result = self._assess(
+            [
+                att("tokA", self.occ, "2026-09-07T10:00:00+08:00"),
+                att("tokA", self.occ, "2026-09-07T09:30:00+08:00", source="offline",
+                    received="2026-09-10T10:00:00+08:00"),
+                att("tokB", self.occ, "2026-09-07T10:00:00+08:00"),
+                att("tokC", self.occ, "2026-09-07T10:00:00+08:00"),
+                att("tokD", self.occ, "2026-09-07T10:00:00+08:00"),
+            ],
+            adaptations={"student-001": adaptation},
+            token_to_student={"tokA": "student-001"},
+        )
+        self.assertTrue(result.confirmed)
+        self.assertIn("adapted:tokA", result.flags)
+        for trace in (*result.flags, *result.reasons):
+            self.assertNotIn("student-001", trace)  # 留痕只用假名 token
+        self.assertEqual(set(result.selected_occurred),
+                         {"tokA", "tokB", "tokC", "tokD"})
 
 
 # ---------------------------------------------------------------- 账本还原

@@ -13,7 +13,7 @@
 - venue_conflict      实际场地观测与他班占用冲突；
 - takeover_chain      临时占课连续发生（其他学科占用体育课）；
 - capacity_breach     实际在场人数超过安全容量；
-- signin_anomaly      重复签到或超时补签集中出现。
+- signin_anomaly      重复签到、超时补签或时钟异常签到集中出现。
 """
 
 from __future__ import annotations
@@ -125,14 +125,14 @@ def detect_anomalies(class_id: str, reconstructed: dict) -> list[Anomaly]:
         findings.append(Anomaly(class_id, AnomalyKind.TAKEOVER, evidence,
                                 f"{len(takeovers)} 起连续临时占课"))
 
-    # 签到异常（重复/超时补签）
+    # 签到异常（重复/超时补签/时钟异常）
     signin_hits = sorted(
         occ for occ, flags in flags_by_occasion.items()
-        if any(f.startswith(("duplicate_signin", "offline_late")) for f in flags)
+        if any(f.startswith(("duplicate_signin", "offline_late", "clock_anomaly")) for f in flags)
     )
     if signin_hits:
         findings.append(Anomaly(class_id, AnomalyKind.SIGNIN, tuple(signin_hits),
-                                f"{len(signin_hits)} 个场次出现重复或超时补签"))
+                                f"{len(signin_hits)} 个场次出现重复、超时或时钟异常签到"))
 
     return findings
 

@@ -15,13 +15,19 @@
 
 防虚增：
   - 有效运动时长以“教师申报 × 标准时长上限 × 学生适配”三者取小；
-  - 同一 (学生, 时段场次) 重复签到只计一次，重复事件保留并标记；
-  - 离线补签有受理时限，且同样遵循去重，不能把一节课签成多节课。
+  - 签到时间统一到同一时间线（UTC）比较：接受带时区偏移的 ISO 8601；
+    离线补传必须显式携带偏移，无时区 / 无法解析 / 接收早于发生的记录
+    以 clock_anomaly:* 留痕且不计入；
+  - 同一 (学生, 时段场次) 的候选先逐条判定有效，再按稳定规则选取一条，
+    重复签到以 duplicate_signin:* 留痕，绝不增加人数或时长；
+  - 离线补签受理时限 48 小时（按统一时间线计算），超时以 offline_late:*
+    留痕且不计入，不能把一节课签成多节课。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 from hashlib import blake2b
 
@@ -117,15 +123,63 @@ class ConfirmationResult:
     per_student_minutes: dict[str, int]  # token -> 有效时长（含伤病适配）
     reasons: tuple[str, ...]             # 未确认/折减的可解释原因
     flags: tuple[str, ...]               # 重复签到、自由活动等关注标记
+    # token -> 去重后选中签到的发生时刻（UTC ISO），供审计核对稳定选取规则
+    selected_occurred: dict[str, str] = field(default_factory=dict)
 
 
-def _hours_between(later_iso: str, earlier_iso: str) -> float:
-    from datetime import datetime
+def _parse_instant(value: str) -> tuple[datetime, bool] | None:
+    """把 ISO 8601 时间解析到统一时间线（UTC）。
 
-    fmt = "%Y-%m-%dT%H:%M:%S"
-    later = datetime.strptime(later_iso[:19], fmt)
-    earlier = datetime.strptime(earlier_iso[:19], fmt)
-    return (later - earlier).total_seconds() / 3600
+    返回 (UTC 时刻, 原始串是否带时区偏移)；无法解析返回 None。
+    无偏移的本地钟面按 UTC 处理——这是在线记录（发生即接收）的兼容口径；
+    离线补传则必须显式携带偏移（见 _invalid_attendance_flag）。
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text[-1] in ("Z", "z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc), False
+    return parsed.astimezone(timezone.utc), True
+
+
+def _invalid_attendance_flag(att: SampleAttendance) -> str | None:
+    """逐条判定签到有效性；有效返回 None，无效返回留痕标记。
+
+    标记只含学期假名 token，绝不出现真实学号；无效记录不进入样本。
+    """
+    occurred = _parse_instant(att.occurred_at)
+    received = _parse_instant(att.received_at)
+    if occurred is None or received is None:
+        return f"clock_anomaly:{att.token}:unparseable_time"
+    (occurred_ts, occurred_aware), (received_ts, received_aware) = occurred, received
+    if att.source == "offline" and not (occurred_aware and received_aware):
+        # 离线补传不带时区偏移就无法对齐到统一时间线，拒绝计入
+        return f"clock_anomaly:{att.token}:missing_timezone"
+    if received_ts < occurred_ts:
+        # 接收早于发生：设备时钟异常，拒绝计入
+        return f"clock_anomaly:{att.token}:received_before_occurred"
+    if att.source == "offline":
+        delay_hours = (received_ts - occurred_ts).total_seconds() / 3600
+        if delay_hours > OFFLINE_ACCEPT_HOURS:
+            return f"offline_late:{att.token}"
+    return None
+
+
+def _selection_key(att: SampleAttendance) -> tuple:
+    """稳定选取规则：统一时间线上最早发生；并列按接收时刻、来源、设备。
+
+    选取是候选集合的确定性函数，与事件到达/账本重放顺序无关。
+    只对有效候选调用（时间必然可解析）。
+    """
+    occurred_ts = _parse_instant(att.occurred_at)[0]
+    received_ts = _parse_instant(att.received_at)[0]
+    return (occurred_ts, received_ts, att.source, att.device_id)
 
 
 def assess_session(
@@ -141,31 +195,37 @@ def assess_session(
     """对一场课做三方交叉确认并核算有效运动时长。
 
     adaptations / token_to_student 只在核算内部使用，结果中只回传 token。
+    签到候选先逐条判定有效性（时钟/时限），有效候选再按稳定规则去重
+    选取，确认结果与事件到达顺序无关。
     """
     reasons: list[str] = []
     flags: list[str] = []
     occ = report.occasion
 
-    # ---- 学生侧：去重 + 离线时限 ----
-    unique: dict[str, SampleAttendance] = {}
-    duplicate_tokens: set[str] = set()
+    # ---- 学生侧：先逐条判定有效性，再按稳定规则去重 ----
+    candidates: dict[str, list[SampleAttendance]] = {}
     for att in attendances:
         if att.occasion != occ:
             continue
-        if att.token in unique:
-            # 重复签到：保留最早一条，重复仅标记，绝不增加时长
-            duplicate_tokens.add(att.token)
-            if att.occurred_at < unique[att.token].occurred_at:
-                unique[att.token] = att
-            continue
-        if att.source == "offline":
-            delay = _hours_between(att.received_at, att.occurred_at)
-            if delay > OFFLINE_ACCEPT_HOURS:
-                flags.append(f"offline_late:{att.token}")
-                continue  # 超时限：留痕于账本但不计入
-        unique[att.token] = att
-    for token in sorted(duplicate_tokens):
-        flags.append(f"duplicate_signin:{token}")
+        candidates.setdefault(att.token, []).append(att)
+
+    signin_flags: set[str] = set()
+    unique: dict[str, SampleAttendance] = {}
+    for token, cands in candidates.items():
+        valid: list[SampleAttendance] = []
+        for att in cands:
+            mark = _invalid_attendance_flag(att)
+            if mark is None:
+                valid.append(att)
+            else:
+                # 迟到 / 时钟异常分别留痕，无效记录绝不进入样本
+                signin_flags.add(mark)
+        if len(cands) > 1:
+            # 重复签到：只留痕，绝不增加人数或时长
+            signin_flags.add(f"duplicate_signin:{token}")
+        if valid:
+            unique[token] = min(valid, key=_selection_key)
+    flags.extend(sorted(signin_flags))
 
     # ---- 三方：学生样本量 ----
     required = max(MIN_SAMPLE_COUNT, int(class_headcount * MIN_SAMPLE_RATIO + 0.999))
@@ -213,7 +273,9 @@ def assess_session(
 
     # ---- 每生时长：伤病适配折减（只对抽样确认到的学生出结果）----
     per_student: dict[str, int] = {}
-    for token in unique:
+    selected: dict[str, str] = {}
+    for token in sorted(unique):
+        selected[token] = _parse_instant(unique[token].occurred_at)[0].isoformat()
         student_id = token_to_student.get(token)
         adapted = adaptations.get(student_id) if student_id else None
         if adapted is not None and adapted.skill_code == report.taught_skill:
@@ -231,4 +293,5 @@ def assess_session(
         per_student_minutes=per_student if confirmed else {},
         reasons=tuple(reasons),
         flags=tuple(flags),
+        selected_occurred=selected,
     )
